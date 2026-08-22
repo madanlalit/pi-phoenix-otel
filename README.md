@@ -92,6 +92,14 @@ Because it's plain OTLP, the same stream also works with Jaeger, Grafana Tempo, 
 
 Prompts, responses, and tool results are captured by default so traces are useful for debugging. Set `captureContent: false` (or `PHOENIX_CAPTURE_CONTENT=0`) to keep metadata only. Everything stays local unless you point `endpoint` elsewhere.
 
+## Privacy & Security
+
+- **Zero dependencies** — no supply-chain surface; one source file (~400 lines), fully auditable
+- **No install-time code** — no npm lifecycle scripts; runs only when pi loads it
+- **Local-first** — the only network call is a POST of spans to the endpoint *you* configure (`http://localhost:6006/v1/traces` by default); nothing is sent anywhere else
+- **Content capture is on by default** so traces are useful for debugging — prompts, responses, and tool results are included and could contain sensitive material (e.g., secrets printed by a command you ran). Set `"captureContent": false` or `PHOENIX_CAPTURE_CONTENT=0` for metadata-only tracing (names, timings, token counts, costs)
+- **No HTTPS enforcement** — if you point `endpoint` at a remote `http://` URL, traffic is unencrypted; use an HTTPS endpoint for anything non-local
+
 ## License
 
 MIT
