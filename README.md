@@ -80,6 +80,8 @@ A project-local config at `.pi/phoenix-otel.config.json` overrides the global on
 
 ## Slash commands
 
+- `/otel-start` — start Arize Phoenix in the background via `uvx arize-phoenix serve` (detached: survives pi exiting; logs to `/tmp/pi-phoenix.log`)
+- `/otel-status` — show server status, endpoint, project, service, capture mode, and trace mode
 - `/otel-flush` — flush pending spans immediately
 
 ## How it works

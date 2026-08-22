@@ -39,6 +39,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 // --- configuration: env vars > user config file > defaults -----------------
@@ -87,6 +88,38 @@ const SESSION_TRACES = CFG.trace === "session";
 
 const MAX_TEXT = 8192;
 const MAX_TOOL_RESULT = 4096;
+
+// --- Phoenix lifecycle helpers ---------------------------------------------
+
+const PHOENIX_BASE = new URL(ENDPOINT).origin;
+const LOG_FILE = path.join(os.tmpdir(), "pi-phoenix.log");
+
+/** True if the Phoenix server answers on its base URL. */
+async function phoenixUp(timeoutMs = 2500): Promise<boolean> {
+	try {
+		const res = await fetch(PHOENIX_BASE, { signal: AbortSignal.timeout(timeoutMs) });
+		return res.status < 500;
+	} catch {
+		return false;
+	}
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Locate a usable uvx binary (PATH lookup happens implicitly via spawn). */
+function findUvx(): string | null {
+	const candidates = ["uvx", "/opt/homebrew/bin/uvx", "/usr/local/bin/uvx", path.join(os.homedir(), ".local/bin/uvx")];
+	for (const c of candidates) {
+		if (!c.includes("/")) continue; // bare name: let spawn resolve via PATH
+		try {
+			fs.accessSync(c, fs.constants.X_OK);
+			return c;
+		} catch {
+			// keep looking
+		}
+	}
+	return null;
+}
 
 // ---------------------------------------------------------------------------
 // Minimal protobuf encoder (OTLP wire format)
@@ -429,6 +462,69 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			await flush();
 			ctx.ui.notify(`Phoenix OTel: flushed → ${ENDPOINT}`, "info");
+		},
+	});
+
+	pi.registerCommand("otel-status", {
+		description: "Show Phoenix OTel configuration and server status",
+		handler: async (_args, ctx) => {
+			const up = await phoenixUp();
+			ctx.ui.notify(
+				`Phoenix OTel — server: ${up ? "running" : "down"} (${PHOENIX_BASE}) · project: "${PROJECT}" · service: "${SERVICE}" · content: ${CAPTURE ? "on" : "off"} · traces/session: ${SESSION_TRACES ? "session" : "run"}`,
+				up ? "info" : "warning",
+			);
+		},
+	});
+
+	pi.registerCommand("otel-start", {
+		description: "Start Arize Phoenix in the background via uvx",
+		handler: async (_args, ctx) => {
+			if (await phoenixUp()) {
+				ctx.ui.notify(`Phoenix is already running at ${PHOENIX_BASE}`, "info");
+				return;
+			}
+
+			const uvx = findUvx();
+			if (!uvx) {
+				ctx.ui.notify(
+					"uvx not found — install uv (`brew install uv`) or start Phoenix manually.",
+					"error",
+				);
+				return;
+			}
+
+			const logFd = fs.openSync(LOG_FILE, "a");
+			let child;
+			try {
+				// Detached: Phoenix keeps running after pi exits. Output goes to a log file.
+				child = spawn(uvx, ["arize-phoenix", "serve"], {
+					detached: true,
+					stdio: ["ignore", logFd, logFd],
+				});
+			} catch (err) {
+				ctx.ui.notify(`Failed to spawn uvx: ${String(err)}`, "error");
+				return;
+			}
+			child.unref();
+
+			ctx.ui.notify(
+				`Starting Phoenix via ${uvx} (first run downloads packages; logs: ${LOG_FILE})…`,
+				"info",
+			);
+
+			// Poll until healthy (generous timeout for cold starts).
+			for (let i = 0; i < 60; i++) {
+				await sleep(2000);
+				if (await phoenixUp()) {
+					ctx.ui.notify(`Phoenix is up → ${PHOENIX_BASE}`, "info");
+					return;
+				}
+				if (child.exitCode !== null && child.signalCode !== null) break;
+			}
+			ctx.ui.notify(
+				`Phoenix did not come up within 2 minutes — check ${LOG_FILE}`,
+				"warning",
+			);
 		},
 	});
 }
