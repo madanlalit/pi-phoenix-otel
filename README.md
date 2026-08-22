@@ -2,17 +2,45 @@
 
 [![Pi package](https://img.shields.io/badge/pi-package-6c5ce7)](https://pi.dev/packages)
 
-Stream [pi](https://pi.dev) coding-agent sessions to [Arize Phoenix](https://github.com/Arize-ai/phoenix) as OpenTelemetry traces — and watch every prompt, tool call, token, and cent in a real trace waterfall.
+Stream [pi](https://pi.dev) coding-agent sessions to [Arize Phoenix](https://github.com/Arize-ai/phoenix) as OpenTelemetry traces — every prompt, tool call, token, and cent rendered as a queryable trace waterfall.
 
-**Zero dependencies.** The OTLP protobuf encoding is hand-rolled inside a single extension file (~250 lines). No collector, no SDK install, no Docker.
+## Why This Exists
+
+Agent sessions are black boxes: you see the final answer, but not the twelve tool calls, two dead ends, and 40k cache-tokens it took to get there. LLM observability tools solve this — but wiring a coding agent into one usually means an SDK dependency, a collector daemon, or both.
+
+This extension is none of that. It subscribes to pi's lifecycle events, hand-encodes OTLP protobuf in ~400 lines of zero-dependency TypeScript, and POSTs straight to Phoenix. If Phoenix is down, exports fail silently and your agent never notices.
+
+**Zero dependencies. No install-time scripts. One auditable file.**
+
+## Requirements
+
+- [pi](https://pi.dev) installed and working
+- [Phoenix](https://github.com/Arize-ai/phoenix), running locally (no Docker needed):
+
+  ```bash
+  uvx arize-phoenix serve     # or: pip install arize-phoenix && phoenix serve
+  ```
+
+  UI opens on `http://localhost:6006`. Projects are auto-created on first trace.
+
+## Install
 
 ```bash
 pi install npm:pi-phoenix-otel
 ```
 
-## What you get
+Then restart pi (or run `/reload`) and send a message.
 
-One trace per pi session:
+### First run
+
+| You have... | What happens |
+| --- | --- |
+| Phoenix already running | Traces flow immediately into your configured project |
+| Phoenix not running | Run `/otel-start` — launches Phoenix via `uvx` in the background, waits for health, notifies you |
+
+## What You Get
+
+One trace per pi session (default):
 
 ```
 pi.session · my-repo
@@ -26,31 +54,14 @@ pi.session · my-repo
 └── ...
 ```
 
-Captured per turn: input/output tokens, cache read/write tokens, **cost**, request/response model, reasoning size.
-Captured per tool call: name, arguments, result text, error flag, duration.
-Captured per run/session: full prompt text (including steers & queued follow-ups), final response, image count, cwd, session id.
+| Level | Captured |
+| --- | --- |
+| Turn | input/output tokens, cache read/write tokens, **cost**, request/response model, reasoning size |
+| Tool call | name, arguments, result text, error flag, duration |
+| Run | prompt text (incl. steers & queued follow-ups), final response, image count |
+| Session | session id/path, cwd, run count, total duration |
 
-Prefer one trace per user prompt instead? Set `"trace": "run"` in the config.
-
-## Requirements
-
-- [Phoenix](https://github.com/Arize-ai/phoenix) running locally (no Docker needed):
-
-  ```bash
-  uvx arize-phoenix serve     # or: pip install arize-phoenix && phoenix serve
-  ```
-
-  UI opens on `http://localhost:6006`. Traces land in the configured project (auto-created).
-
-- [pi](https://pi.dev) installed and working.
-
-## Install
-
-```bash
-pi install npm:pi-phoenix-otel
-```
-
-Restart pi (or `/reload`) and send a message. That's it.
+Prefer one trace per user prompt instead of per session? Set `"trace": "run"` in the config.
 
 ## Configuration
 
@@ -68,39 +79,29 @@ Optional config file at `~/.pi/agent/phoenix-otel.config.json`:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `endpoint` | `http://localhost:6006/v1/traces` | OTLP/HTTP endpoint (works with any OTLP backend) |
+| `endpoint` | `http://localhost:6006/v1/traces` | OTLP/HTTP endpoint — any OTLP backend works (Grafana Tempo, Jaeger, SigNoz…) |
 | `service` | `pi-coding-agent` | `service.name` resource attribute |
-| `project` | `pi` | Phoenix project (auto-created; also works with Grafana/Jaeger via generic OTLP) |
-| `captureContent` | `true` | Set `false` for metadata-only tracing (no prompts/responses/tool text) |
-| `trace` | `session` | `"session"` = one trace per session, `"run"` = one trace per user prompt |
+| `project` | `pi` | Phoenix project name — auto-created on first trace |
+| `captureContent` | `true` | `false` = metadata-only tracing (no prompts/responses/tool text) |
+| `trace` | `session` | `"session"` = one trace per session · `"run"` = one trace per user prompt |
 
-Environment variables override the file: `PHOENIX_OTEL_ENDPOINT`, `PHOENIX_SERVICE_NAME`, `PHOENIX_PROJECT`, `PHOENIX_CAPTURE_CONTENT=0`, `PHOENIX_TRACE=run`, and `PHOENIX_OTEL_ENABLED=0` to disable.
+A project-local config at `.pi/phoenix-otel.config.json` overrides the global file for that repo. Environment variables override everything: `PHOENIX_OTEL_ENDPOINT`, `PHOENIX_SERVICE_NAME`, `PHOENIX_PROJECT`, `PHOENIX_TRACE`, `PHOENIX_CAPTURE_CONTENT=0`.
 
-A project-local config at `.pi/phoenix-otel.config.json` overrides the global one for that repo.
+## Slash Commands
 
-## Slash commands
-
-- `/otel-start` — start Arize Phoenix in the background via `uvx arize-phoenix serve` (detached: survives pi exiting; logs to `/tmp/pi-phoenix.log`)
-- `/otel-status` — show server status, endpoint, project, service, capture mode, and trace mode
-- `/otel-flush` — flush pending spans immediately
-
-## How it works
-
-The extension subscribes to pi's lifecycle events (`input`, `agent_start/end`, `turn_start/end`, `message_end`, `tool_execution_start/end`, `session_shutdown`) and maps them onto spans following the [OpenInference](https://github.com/Arize-ai/openinference) / GenAI semantic conventions. Batches are encoded as OTLP/HTTP protobuf by hand and POSTed to your endpoint. If Phoenix is down, exports fail silently — your agent never notices.
-
-Because it's plain OTLP, the same stream also works with Jaeger, Grafana Tempo, SigNoz, or any OTLP-capable backend.
-
-## Privacy
-
-Prompts, responses, and tool results are captured by default so traces are useful for debugging. Set `captureContent: false` (or `PHOENIX_CAPTURE_CONTENT=0`) to keep metadata only. Everything stays local unless you point `endpoint` elsewhere.
+| Command | Action |
+| --- | --- |
+| `/otel-start` | Launch Phoenix via `uvx arize-phoenix serve` as a detached background process; polls until healthy (survives pi exiting; logs to `/tmp/pi-phoenix.log`) |
+| `/otel-status` | Server status, endpoint, project, service, capture mode, trace mode |
+| `/otel-flush` | Flush pending spans immediately |
 
 ## Privacy & Security
 
 - **Zero dependencies** — no supply-chain surface; one source file (~400 lines), fully auditable
 - **No install-time code** — no npm lifecycle scripts; runs only when pi loads it
 - **Local-first** — the only network call is a POST of spans to the endpoint *you* configure (`http://localhost:6006/v1/traces` by default); nothing is sent anywhere else
-- **Content capture is on by default** so traces are useful for debugging — prompts, responses, and tool results are included and could contain sensitive material (e.g., secrets printed by a command you ran). Set `"captureContent": false` or `PHOENIX_CAPTURE_CONTENT=0` for metadata-only tracing (names, timings, token counts, costs)
-- **No HTTPS enforcement** — if you point `endpoint` at a remote `http://` URL, traffic is unencrypted; use an HTTPS endpoint for anything non-local
+- **Content capture is on by default** so traces are useful for debugging — prompts, responses, and tool results are included and can contain sensitive material (e.g., secrets echoed by a command you ran). Set `"captureContent": false` or `PHOENIX_CAPTURE_CONTENT=0` for metadata-only tracing
+- **No HTTPS enforcement** — if you point `endpoint` at a remote `http://` URL, traffic is unencrypted; use HTTPS for anything non-local
 
 ## License
 
