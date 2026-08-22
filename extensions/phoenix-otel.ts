@@ -106,11 +106,24 @@ async function phoenixUp(timeoutMs = 2500): Promise<boolean> {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Locate a usable uvx binary (PATH lookup happens implicitly via spawn). */
+/** Locate a usable uvx binary. */
 function findUvx(): string | null {
-	const candidates = ["uvx", "/opt/homebrew/bin/uvx", "/usr/local/bin/uvx", path.join(os.homedir(), ".local/bin/uvx")];
+	// Explicit override is exclusive — if set and unusable, report "not installed".
+	if (process.env.PHOENIX_UVX_PATH) {
+		try {
+			fs.accessSync(process.env.PHOENIX_UVX_PATH, fs.constants.X_OK);
+			return process.env.PHOENIX_UVX_PATH;
+		} catch {
+			return null;
+		}
+	}
+	const candidates = [
+		"/opt/homebrew/bin/uvx",
+		"/usr/local/bin/uvx",
+		path.join(os.homedir(), ".local/bin/uvx"),
+	];
 	for (const c of candidates) {
-		if (!c.includes("/")) continue; // bare name: let spawn resolve via PATH
+		if (!c) continue;
 		try {
 			fs.accessSync(c, fs.constants.X_OK);
 			return c;
@@ -487,7 +500,7 @@ export default function (pi: ExtensionAPI) {
 			const uvx = findUvx();
 			if (!uvx) {
 				ctx.ui.notify(
-					"uvx not found — install uv (`brew install uv`) or start Phoenix manually.",
+					`Cannot start Phoenix: uv is not installed (looked for uvx). Install it with:\n  brew install uv\nThen run /otel-start again. Alternatively start Phoenix manually and open ${PHOENIX_BASE}.`,
 					"error",
 				);
 				return;
@@ -519,7 +532,14 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Phoenix is up → ${PHOENIX_BASE}`, "info");
 					return;
 				}
-				if (child.exitCode !== null && child.signalCode !== null) break;
+				// Process died (port conflict, bad install, …) — fail fast.
+				if (child.exitCode !== null || child.signalCode !== null) {
+					ctx.ui.notify(
+						`Phoenix exited immediately (code ${child.exitCode ?? child.signalCode}) — check ${LOG_FILE}. Is another instance already on port ${new URL(PHOENIX_BASE).port || "6006"}?`,
+						"error",
+					);
+					return;
+				}
 			}
 			ctx.ui.notify(
 				`Phoenix did not come up within 2 minutes — check ${LOG_FILE}`,
