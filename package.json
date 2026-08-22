@@ -1,0 +1,29 @@
+{
+	"name": "pi-phoenix-otel",
+	"version": "0.1.0",
+	"description": "Pi coding agent extension that streams OpenTelemetry GenAI traces to Arize Phoenix. Zero dependencies.",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi-coding-agent",
+		"phoenix",
+		"arize",
+		"opentelemetry",
+		"otel",
+		"observability",
+		"llm",
+		"tracing"
+	],
+	"license": "MIT",
+	"type": "module",
+	"pi": {
+		"extensions": ["./extensions"]
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/lalit/pi-phoenix-otel.git"
+	},
+	"engines": {
+		"node": ">=20"
+	}
+}
