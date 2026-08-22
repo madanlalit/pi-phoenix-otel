@@ -21,7 +21,7 @@
 	},
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/lalit/pi-phoenix-otel.git"
+		"url": "git+https://github.com/madanlalit/pi-phoenix-otel.git"
 	},
 	"engines": {
 		"node": ">=20"
