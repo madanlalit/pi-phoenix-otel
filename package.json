@@ -20,6 +20,9 @@
 	],
 	"license": "MIT",
 	"type": "module",
+	"files": [
+		"extensions"
+	],
 	"homepage": "https://github.com/madanlalit/pi-phoenix-otel#readme",
 	"pi": {
 		"extensions": [
