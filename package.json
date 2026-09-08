@@ -1,6 +1,6 @@
 {
 	"name": "pi-phoenix-otel",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "Pi coding agent extension that streams OpenTelemetry GenAI traces to Arize Phoenix. Zero dependencies.",
 	"keywords": [
 		"pi-package",

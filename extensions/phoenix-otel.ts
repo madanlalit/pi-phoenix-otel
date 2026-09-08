@@ -9,7 +9,7 @@
  *   "session" (default): ONE trace per pi session
  *     pi.session                        (root, SESSION)
  *     ├── pi.run · <prompt snippet>     (one per user prompt)
- *     │   ├── pi.turn {n}               (LLM: tokens, cost, model)
+ *     │   ├── pi.turn {n}               (LLM: tokens, cost, model, finish reason)
  *     │   │   └── execute_tool <name>   (TOOL: arguments, result, errors)
  *     └── pi.run · …
  *   "run": one trace per user prompt (pi.run root + turns/tools)
@@ -21,6 +21,7 @@
  *        PHOENIX_SERVICE_NAME      service.name resource attribute
  *                                  (default "pi-coding-agent")
  *        PHOENIX_PROJECT           Phoenix project name (default "pi")
+ *        PHOENIX_API_KEY           Bearer token for Phoenix Cloud / auth proxies
  *        PHOENIX_CAPTURE_CONTENT=0 metadata only — no prompt/response/tool text
  *        PHOENIX_OTEL_ENABLED=0    disable the extension entirely
  *   2. Config file ~/.pi/agent/phoenix-otel.config.json:
@@ -28,6 +29,7 @@
  *          "endpoint": "http://localhost:6006/v1/traces",
  *          "service": "pi-coding-agent",
  *          "project": "pi",
+ *          "apiKey": "",
  *          "captureContent": true
  *        }
  *
@@ -48,6 +50,7 @@ interface OtelConfig {
 	endpoint: string;
 	service: string;
 	project: string;
+	apiKey?: string;
 	captureContent: boolean;
 	trace: "session" | "run";
 }
@@ -70,6 +73,7 @@ function loadConfig(): OtelConfig {
 		endpoint: process.env.PHOENIX_OTEL_ENDPOINT ?? file.endpoint ?? "http://localhost:6006/v1/traces",
 		service: process.env.PHOENIX_SERVICE_NAME ?? file.service ?? "pi-coding-agent",
 		project: process.env.PHOENIX_PROJECT ?? file.project ?? "pi",
+		apiKey: process.env.PHOENIX_API_KEY ?? file.apiKey ?? undefined,
 		captureContent:
 			process.env.PHOENIX_CAPTURE_CONTENT === "0"
 				? false
@@ -83,11 +87,72 @@ const ENDPOINT = CFG.endpoint;
 const ENABLED = process.env.PHOENIX_OTEL_ENABLED !== "0";
 const SERVICE = CFG.service;
 const PROJECT = CFG.project;
+const API_KEY = CFG.apiKey;
 const CAPTURE = CFG.captureContent;
 const SESSION_TRACES = CFG.trace === "session";
+const EXT_VERSION = "0.2.0";
 
-const MAX_TEXT = 8192;
-const MAX_TOOL_RESULT = 4096;
+const MAX_TEXT = 8192; // bytes
+const MAX_TOOL_RESULT = 4096; // bytes
+const MAX_PARAMS = 2048; // bytes
+const MAX_SYSTEM_PROMPT = 4096; // bytes
+
+// --- text utilities (UTF-8 / ANSI safe) -------------------------------------
+
+const UTF8 = new TextEncoder();
+
+/** Truncate a string to at most maxBytes of UTF-8 without splitting code points. */
+function trunc(s: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	let bytes = 0;
+	for (let i = 0; i < s.length; i++) {
+		const cp = s.codePointAt(i)!;
+		const w = cp > 0xffff ? 4 : cp > 0x7ff ? 3 : cp > 0x7f ? 2 : 1;
+		if (bytes + w > maxBytes) return s.slice(0, i);
+		bytes += w;
+		if (cp > 0xffff) i++; // skip low surrogate
+	}
+	return s;
+}
+
+/** Collapse whitespace and truncate — for span names. */
+function preview(s: string, maxBytes: number): string {
+	return trunc(s.replace(/\s+/g, " ").trim(), maxBytes);
+}
+
+// strip-ansi pattern (MIT) + OSC sequences — terminal formatting never belongs in traces
+const ANSI_RE =
+	/[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]*)*)?\u0007)|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-ntqry=><~]))/g;
+
+function clean(s: string): string {
+	return s.replace(ANSI_RE, "");
+}
+
+/** JSON.stringify with circular-reference protection; returns undefined on failure. */
+function safeJson(value: unknown, maxBytes: number): string | undefined {
+	const seen = new WeakSet<object>();
+	try {
+		const out = JSON.stringify(value, (_k, v: unknown) => {
+			if (typeof v !== "object" || v === null) return v;
+			if (seen.has(v as object)) return "[Circular]";
+			seen.add(v as object);
+			return v;
+		});
+		return out === undefined ? undefined : trunc(out, maxBytes);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Pick a short, human-friendly span name for a tool call. */
+function toolSpanName(name: string, args: unknown): string {
+	const a = (args ?? {}) as Record<string, unknown>;
+	if (typeof a.command === "string") return `${name}: ${preview(a.command, 60)}`;
+	if (typeof a.path === "string") return `${name} ${a.path}`;
+	if (typeof a.file_path === "string") return `${name} ${a.file_path}`;
+	if (typeof a.pattern === "string") return `${name}: ${preview(a.pattern, 40)}`;
+	return name;
+}
 
 // --- Phoenix lifecycle helpers ---------------------------------------------
 
@@ -174,7 +239,7 @@ const f64 = (field: number, value: bigint): Bytes => {
 
 // AnyValue: string_value=1, bool_value=2, int_value=3, double_value=4
 const anyValue = (v: string | number | boolean): Bytes => {
-	if (typeof v === "string") return lenDelim(1, new TextEncoder().encode(v));
+	if (typeof v === "string") return lenDelim(1, UTF8.encode(v));
 	if (typeof v === "boolean") return vint(2, v ? 1 : 0);
 	if (Number.isInteger(v)) return vint(3, v);
 	const out = new Uint8Array(9);
@@ -183,7 +248,7 @@ const anyValue = (v: string | number | boolean): Bytes => {
 	return out;
 };
 
-const str = (field: number, s: string): Bytes => lenDelim(field, new TextEncoder().encode(s));
+const str = (field: number, s: string): Bytes => lenDelim(field, UTF8.encode(s));
 
 // KeyValue: key=1 (string), value=2 (AnyValue)
 const keyValue = (k: string, v: string | number | boolean): Bytes =>
@@ -221,7 +286,7 @@ const encodeSpan = (s: Span): Bytes => {
 // InstrumentationScope: name=1, version=2
 const scope = lenDelim(
 	1,
-	concat(str(1, "pi.extension.phoenix-otel"), str(2, "0.1.0")),
+	concat(str(1, "pi.extension.phoenix-otel"), str(2, EXT_VERSION)),
 );
 
 // ResourceSpans: resource=1 → ScopeSpans: scope=1, spans=2
@@ -244,14 +309,73 @@ const encodeBatch = (spans: Span[]): Bytes => {
 
 const hexBytes = (n: number): Bytes => new Uint8Array(crypto.randomBytes(n));
 const nowNs = () => BigInt(Date.now()) * 1_000_000n;
-const trunc = (s: string, n: number) => (s.length > n ? s.slice(0, n) : s);
 
 const textOf = (m: Record<string, any>): string => {
 	const c = m.content;
-	if (typeof c === "string") return c;
+	if (typeof c === "string") return clean(c);
 	if (!Array.isArray(c)) return "";
-	return c.filter((b: any) => b?.type === "text").map((b: any) => b.text ?? "").join("");
+	return c
+		.filter((b: any) => b?.type === "text")
+		.map((b: any) => clean(b.text ?? ""))
+		.join("");
 };
+
+/** pi's Usage shape is flat ({ input, output, cacheRead, … }); older builds
+ *  nested token counts ({ input: { tokens } }). Support both defensively. */
+const num = (v: unknown): number | undefined =>
+	typeof v === "number" && Number.isFinite(v) ? v : undefined;
+
+function extractUsage(m: Record<string, any>): Span["attributes"] {
+	const u = (m.usage ?? {}) as Record<string, any>;
+	const attrs: Span["attributes"] = {};
+	const input = num(u.input) ?? num(u.input?.tokens);
+	const output = num(u.output) ?? num(u.output?.tokens);
+	const cacheRead = num(u.cacheRead) ?? num(u.cacheRead?.tokens);
+	const cacheWrite = num(u.cacheWrite) ?? num(u.cacheWrite?.tokens);
+	const reasoning = num(u.reasoning);
+	const cost = (u.cost ?? {}) as Record<string, unknown>;
+
+	if (input != null) attrs["gen_ai.usage.input_tokens"] = input;
+	if (output != null) attrs["gen_ai.usage.output_tokens"] = output;
+	if (cacheRead != null) attrs["gen_ai.usage.cache_read_input_tokens"] = cacheRead;
+	if (cacheWrite != null) attrs["gen_ai.usage.cache_write_input_tokens"] = cacheWrite;
+	if (reasoning != null) attrs["gen_ai.usage.reasoning_tokens"] = reasoning;
+
+	const total = num(cost.total);
+	if (total != null) attrs["gen_ai.usage.cost"] = total;
+	const costInput = num(cost.input);
+	const costCacheRead = num(cost.cacheRead);
+	const costCacheWrite = num(cost.cacheWrite);
+	const costOutput = num(cost.output);
+	if (costInput != null || costCacheRead != null || costCacheWrite != null) {
+		attrs["gen_ai.usage.cost.prompt"] =
+			(costInput ?? 0) + (costCacheRead ?? 0) + (costCacheWrite ?? 0);
+	}
+	if (costOutput != null) attrs["gen_ai.usage.cost.completion"] = costOutput;
+	if (costInput != null) attrs["gen_ai.usage.cost.input"] = costInput;
+	if (costCacheRead != null) attrs["gen_ai.usage.cost.cache_read"] = costCacheRead;
+	if (costCacheWrite != null) attrs["gen_ai.usage.cost.cache_write"] = costCacheWrite;
+	return attrs;
+}
+
+/** Invocation parameters (temperature, max_tokens, …) from the raw provider payload. */
+function extractParams(payload: unknown): { params?: string; toolsCount?: number } {
+	if (!payload || typeof payload !== "object") return {};
+	const p = payload as Record<string, unknown>;
+	const kept: Record<string, unknown> = {};
+	for (const [k, v] of Object.entries(p)) {
+		if (k === "messages" || k === "input" || k === "tools" || k === "system") continue;
+		kept[k] = v;
+	}
+	const toolsCount = Array.isArray(p.tools) ? p.tools.length : undefined;
+	const params = Object.keys(kept).length > 0 ? safeJson(kept, MAX_PARAMS) : undefined;
+	return { params, toolsCount };
+}
+
+/** OSC-8 terminal hyperlink; terminals that don't support it just show the label. */
+function hyperlink(label: string, url: string): string {
+	return `\u001B]8;;${url}\u0007${label}\u001B]8;;\u0007`;
+}
 
 export default function (pi: ExtensionAPI) {
 	if (!ENABLED) return;
@@ -266,24 +390,48 @@ export default function (pi: ExtensionAPI) {
 	let runInputs: string[] = [];
 	let runOutputs: string[] = [];
 	let runImages = 0;
+	let systemPrompt: string | undefined;
+	let lastParams: string | undefined;
+	let lastToolsCount: number | undefined;
 	const openTools = new Map<string, Span>();
 	const buffer: Span[] = [];
 	let sessionRoot: Span | null = null;
 	let runCount = 0;
+	let statusCtx: { hasUI: boolean; ui: any } | null = null;
+
+	function setStatusLink(ui: any, hasUI: boolean) {
+		if (!hasUI || !ui || !sessionId) return;
+		const url = `${PHOENIX_BASE}/redirects/sessions/${encodeURIComponent(sessionId)}`;
+		try {
+			ui.setStatus("phoenix-otel", hyperlink("phoenix ↗", url));
+		} catch {
+			// status API unavailable — not fatal
+		}
+	}
 
 	async function flush() {
 		if (buffer.length === 0) return;
 		const batch = buffer.splice(0, buffer.length);
-		try {
-			const res = await fetch(ENDPOINT, {
-				method: "POST",
-				headers: { "Content-Type": "application/x-protobuf" },
-				body: encodeBatch(batch) as unknown as BodyInit,
-			});
-			if (!res.ok) console.error(`[phoenix-otel] export failed: ${res.status}`);
-		} catch {
-			// Phoenix unreachable — never break the agent loop.
+		const body = encodeBatch(batch);
+		const headers: Record<string, string> = { "Content-Type": "application/x-protobuf" };
+		if (API_KEY) headers.Authorization = `Bearer ${API_KEY}`;
+		// One retry, then drop — Phoenix unreachable must never break the agent loop.
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				const res = await fetch(ENDPOINT, {
+					method: "POST",
+					headers,
+					body: body as unknown as BodyInit,
+				});
+				if (res.ok) return true;
+				if (res.status >= 400 && res.status < 500) break; // don't retry client errors
+			} catch {
+				// network error — fall through to retry
+			}
+			if (attempt === 0) await sleep(1000);
 		}
+		console.error(`[phoenix-otel] export failed after retry: ${ENDPOINT}`);
+		return false;
 	}
 
 	function close(span: Span, extraAttrs: Span["attributes"] = {}) {
@@ -292,22 +440,17 @@ export default function (pi: ExtensionAPI) {
 		buffer.push(span);
 	}
 
-	function extractUsage(m: Record<string, any>) {
-		const usage = m.usage ?? {};
-		const attrs: Span["attributes"] = {};
-		if (usage.input?.tokens != null) attrs["gen_ai.usage.input_tokens"] = usage.input.tokens;
-		if (usage.output?.tokens != null) attrs["gen_ai.usage.output_tokens"] = usage.output.tokens;
-		if (usage.cacheRead?.tokens != null)
-			attrs["gen_ai.usage.cache_read_input_tokens"] = usage.cacheRead.tokens;
-		if (usage.cacheWrite?.tokens != null)
-			attrs["gen_ai.usage.cache_write_input_tokens"] = usage.cacheWrite.tokens;
-		if (usage.cost?.total != null) attrs["gen_ai.usage.cost"] = usage.cost.total;
-		return attrs;
-	}
-
 	pi.on("session_start", async (_event, ctx) => {
-		sessionId = (ctx as any).sessionManager?.sessionId ?? hexBytes(8).toString("hex");
-		sessionPath = (ctx as any).sessionManager?.sessionFile ?? (ctx as any).sessionManager?.path ?? "";
+		const sm = (ctx as any).sessionManager;
+		sessionId =
+			(typeof sm?.getSessionId === "function" ? sm.getSessionId() : undefined) ??
+			sm?.sessionId ??
+			crypto.randomBytes(8).toString("hex");
+		sessionPath =
+			(typeof sm?.getSessionFile === "function" ? sm.getSessionFile() : undefined) ??
+			sm?.sessionFile ??
+			sm?.path ??
+			"";
 		cwd = ctx.cwd;
 	});
 
@@ -315,14 +458,29 @@ export default function (pi: ExtensionAPI) {
 	// (kept even when captureContent=false: needed for span naming; content is
 	// only written into attributes under CAPTURE)
 	pi.on("input", async (event) => {
-		runInputs.push(trunc(event.text ?? "", MAX_TEXT));
+		runInputs.push(trunc(clean(event.text ?? ""), MAX_TEXT));
 		runImages += event.images?.length ?? 0;
+	});
+
+	pi.on("before_agent_start", async (event) => {
+		// Fully assembled system prompt for this run (content-gated).
+		systemPrompt = CAPTURE && event.systemPrompt ? trunc(clean(event.systemPrompt), MAX_SYSTEM_PROMPT) : undefined;
+	});
+
+	pi.on("before_provider_request", async (event) => {
+		// Raw provider payload — keep only invocation parameters (temperature,
+		// max_tokens, …), gated by captureContent since payloads vary by provider.
+		// Messages/tools are excluded; tool count kept as pure metadata.
+		const { params, toolsCount } = extractParams(event.payload);
+		if (CAPTURE && params) lastParams = params;
+		if (toolsCount != null) lastToolsCount = toolsCount;
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
 		const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
 		const first = runInputs[0] ?? "(no text)";
-		const snippet = trunc(first.replace(/\s+/g, " ").trim(), 48);
+		const snippet = preview(first, 48);
+		statusCtx = { hasUI: (ctx as any).hasUI, ui: (ctx as any).ui };
 
 		if (SESSION_TRACES && !sessionRoot) {
 			// Lazily create the session root so the trace exists from the first
@@ -330,12 +488,12 @@ export default function (pi: ExtensionAPI) {
 			sessionRoot = {
 				traceId: hexBytes(16),
 				spanId: hexBytes(8),
-				name: `pi.session · ${trunc(path.basename(cwd || "~"), 40)}`,
+				name: `pi.session · ${preview(path.basename(cwd || "~"), 40)}`,
 				startNs: nowNs(),
 				attributes: {
 					"session.id": sessionId,
 					"session.path": trunc(sessionPath, 512),
-					"cwd": cwd,
+					cwd: cwd,
 					"gen_ai.system": "pi",
 					"openinference.span.kind": "SESSION",
 				},
@@ -351,7 +509,7 @@ export default function (pi: ExtensionAPI) {
 				? `pi.run ${++runCount} · ${snippet}${first.length > 48 ? "…" : ""}`
 				: `pi.run · ${snippet}${first.length > 48 ? "…" : ""}`,
 			startNs: nowNs(),
-				attributes: {
+			attributes: {
 				"gen_ai.system": "pi",
 				"gen_ai.request.model": model,
 				"openinference.span.kind": "AGENT",
@@ -376,6 +534,7 @@ export default function (pi: ExtensionAPI) {
 				...(CAPTURE && rootSpan.attributes["input.value"]
 					? { "input.value": String(rootSpan.attributes["input.value"]) }
 					: {}),
+				...(systemPrompt ? { "gen_ai.prompt.system": systemPrompt } : {}),
 			},
 		};
 	});
@@ -387,7 +546,12 @@ export default function (pi: ExtensionAPI) {
 		if (!target) return;
 
 		Object.assign(target.attributes, extractUsage(m));
-		if (m.model) target.attributes["gen_ai.response.model"] = m.model;
+		if (lastParams) target.attributes["llm.invocation_parameters"] = lastParams;
+		if (lastToolsCount != null) target.attributes["gen_ai.request.tools_count"] = lastToolsCount;
+		if (m.responseModel || m.model) {
+			target.attributes["gen_ai.response.model"] = m.responseModel ?? m.model;
+		}
+		if (m.stopReason) target.attributes["gen_ai.response.finish_reason"] = m.stopReason;
 
 		const text = textOf(m);
 		if (text) {
@@ -412,13 +576,15 @@ export default function (pi: ExtensionAPI) {
 			traceId: parent.traceId,
 			spanId: hexBytes(8),
 			parentSpanId: parent.spanId,
-			name: `execute_tool ${event.toolName}`,
+			name: toolSpanName(event.toolName, event.args),
 			startNs: nowNs(),
 			attributes: {
 				"openinference.span.kind": "TOOL",
 				"gen_ai.tool.name": event.toolName,
 				"gen_ai.tool.call.id": event.toolCallId,
-				...(CAPTURE ? { "tool.arguments": trunc(JSON.stringify(event.args ?? {}), MAX_TOOL_RESULT) } : {}),
+				...(CAPTURE
+					? { "tool.arguments": trunc(safeJson(event.args ?? {}, MAX_TOOL_RESULT) ?? "{}", MAX_TOOL_RESULT) }
+					: {}),
 			},
 		});
 	});
@@ -428,11 +594,11 @@ export default function (pi: ExtensionAPI) {
 		if (!span) return;
 		openTools.delete(event.toolCallId);
 		const resultText = CAPTURE
-			? textOf((event.result ?? {}) as Record<string, any>) || JSON.stringify(event.result ?? "")
+			? trunc(clean(textOf((event.result ?? {}) as Record<string, any>)) || clean(JSON.stringify(event.result ?? "")), MAX_TOOL_RESULT)
 			: "(redacted)";
 		close(span, {
 			"tool.is_error": !!event.isError,
-			"output.value": trunc(resultText, MAX_TOOL_RESULT),
+			"output.value": resultText,
 		});
 	});
 
@@ -441,6 +607,10 @@ export default function (pi: ExtensionAPI) {
 			close(currentTurnSpan);
 			currentTurnSpan = null;
 		}
+		lastParams = undefined;
+		lastToolsCount = undefined;
+		// Checkpoint after each turn — a crash mid-run loses at most one turn.
+		await flush();
 	});
 
 	pi.on("agent_end", async () => {
@@ -458,16 +628,26 @@ export default function (pi: ExtensionAPI) {
 		runInputs = [];
 		runOutputs = [];
 		runImages = 0;
+		systemPrompt = undefined;
 		await flush();
+		// Trace is now queryable — surface a clickable link to the session.
+		setStatusLink(statusCtx?.ui, statusCtx?.hasUI ?? false);
 	});
 
-	pi.on("session_shutdown", async () => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		if (sessionRoot) {
 			close(sessionRoot, { "session.run_count": runCount });
 			sessionRoot = null;
 		}
 		runCount = 0;
 		await flush();
+		if ((ctx as any).hasUI) {
+			try {
+				(ctx as any).ui.setStatus("phoenix-otel", undefined);
+			} catch {
+				// status API unavailable — not fatal
+			}
+		}
 	});
 
 	pi.registerCommand("otel-flush", {
@@ -483,7 +663,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			const up = await phoenixUp();
 			ctx.ui.notify(
-				`Phoenix OTel — server: ${up ? "running" : "down"} (${PHOENIX_BASE}) · project: "${PROJECT}" · service: "${SERVICE}" · content: ${CAPTURE ? "on" : "off"} · traces/session: ${SESSION_TRACES ? "session" : "run"}`,
+				`Phoenix OTel — server: ${up ? "running" : "down"} (${PHOENIX_BASE}) · project: "${PROJECT}" · service: "${SERVICE}" · content: ${CAPTURE ? "on" : "off"} · traces/session: ${SESSION_TRACES ? "session" : "run"} · auth: ${API_KEY ? "bearer" : "none"}${sessionId ? ` · session: ${sessionId.slice(0, 8)}…` : ""}`,
 				up ? "info" : "warning",
 			);
 		},
